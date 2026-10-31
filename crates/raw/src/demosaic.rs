@@ -221,8 +221,8 @@ pub(crate) fn demosaic(p: &Padded, phase: [u8; 4], method: Demosaic, to_xyz: &Ma
 
 /// [`demosaic`] without the full RGB frame and without the padded plane: every band loads the
 /// rows it reads (`fill(y, row)` writes the normalized CFA row `y` of the image, `w` samples;
-/// the mirrored borders are added here), demosaics into a band buffer, and `emit(rgb, out)`
-/// turns it into the band's `out` samples (the same rows, `w * 3` per row). Each pixel depends
+/// the mirrored borders are added here), demosaics into a band buffer, and `emit(first, rgb, out)`
+/// turns it into the band's `out` samples (`first`: the band's first pixel, `y * w`) (the same rows, `w * 3` per row). Each pixel depends
 /// only on the plane around it, never on how rows are split or ordered, so the result is that
 /// of `emit` over [`demosaic`] of the filled plane.
 #[allow(clippy::too_many_arguments)]
@@ -235,7 +235,7 @@ pub(crate) fn demosaic_fused(
     jobs: usize,
     fill: &(impl Fn(usize, &mut [f32]) + Sync),
     out: &mut [u16],
-    emit: &(impl Fn(&[f32], &mut [u16]) + Sync),
+    emit: &(impl Fn(usize, &[f32], &mut [u16]) + Sync),
 ) {
     if w == 0 || h == 0 || out.len() < w * h * 3 {
         return;
@@ -262,7 +262,7 @@ pub(crate) fn demosaic_fused(
             let buf = &mut buf[..chunk.len()];
             // The window starts at a multiple of AHD_BAND (even), so it is band 0 of its own rows.
             ahd_band(win, w, s, phase, &m, &labf, 0, buf, sc);
-            emit(buf, chunk);
+            emit(band * AHD_BAND * w, buf, chunk);
         });
         return;
     }
@@ -273,7 +273,7 @@ pub(crate) fn demosaic_fused(
         load(win, band * FUSED_ROWS, chunk.len() / (w * 3));
         let buf = &mut buf[..chunk.len()];
         linear_band(win, w, s, phase, method, &ks, band * FUSED_ROWS, band * FUSED_ROWS, buf);
-        emit(buf, chunk);
+        emit(band * FUSED_ROWS * w, buf, chunk);
     });
 }
 
@@ -454,7 +454,7 @@ pub(crate) fn demosaic_cfa(p: &Padded, pat: &Pattern) -> Vec<f32> {
 }
 
 /// [`demosaic_cfa`] without the full RGB frame (the green plane stays): see [`demosaic_fused`].
-pub(crate) fn demosaic_cfa_fused(p: &Padded, pat: &Pattern, jobs: usize, out: &mut [u16], emit: &(impl Fn(&[f32], &mut [u16]) + Sync)) {
+pub(crate) fn demosaic_cfa_fused(p: &Padded, pat: &Pattern, jobs: usize, out: &mut [u16], emit: &(impl Fn(usize, &[f32], &mut [u16]) + Sync)) {
     let (w, h) = (p.w, p.h);
     if out.len() < w * h * 3 {
         return;
@@ -465,7 +465,7 @@ pub(crate) fn demosaic_cfa_fused(p: &Padded, pat: &Pattern, jobs: usize, out: &m
         for_bands(&mut out[..w * h * 3], band * w * 3, h.div_ceil(band), jobs, init, |b, chunk, buf| {
             let buf = &mut buf[..chunk.len()];
             rows(b * band, buf);
-            emit(buf, chunk);
+            emit(b * band * w, buf, chunk);
         });
     });
 }
@@ -1001,7 +1001,7 @@ mod tests {
             let p = Padded::from_plane(&cfa, w, h);
             let fill = |y: usize, row: &mut [f32]| row.copy_from_slice(&cfa[y * w..(y + 1) * w]);
             // Any per-sample map stands in for the encode.
-            let emit = |rgb: &[f32], out: &mut [u16]| {
+            let emit = |_: usize, rgb: &[f32], out: &mut [u16]| {
                 for (o, v) in out.iter_mut().zip(rgb) {
                     *o = (v.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
                 }
@@ -1011,7 +1011,7 @@ mod tests {
                     for jobs in [1, 3, 64] {
                         let full = demosaic(&p, phase, method, &m, jobs);
                         let mut want = vec![0u16; w * h * 3];
-                        emit(&full, &mut want);
+                        emit(0, &full, &mut want);
                         let mut got = vec![0u16; w * h * 3];
                         demosaic_fused(w, h, phase, method, &m, jobs, &fill, &mut got, &emit);
                         assert_eq!(want, got, "{w}x{h} {method:?} {phase:?} {jobs}");

@@ -216,11 +216,24 @@ pub(crate) fn decode(t: &Tiff, limits: &Limits) -> Result<Sensor> {
         }
     }
 
-    // DNG 1.6 ProfileGainTableMap: the local tone mapping that phones (Samsung Expert RAW) rely on
-    // for their default look. Without it the rendering is darker in the shadows.
-    let gain_table_map = ifd0.has(tag::PROFILE_GAIN_TABLE_MAP) || raw.has(tag::PROFILE_GAIN_TABLE_MAP);
-    if gain_table_map {
-        warnings.push("DNG ProfileGainTableMap (local tone mapping) is not applied".to_string());
+    // DNG 1.6 ProfileGainTableMap: the local tone mapping Apple ProRAW and Pixel files render
+    // with, in the raw IFD as the specification places it (a sub-IFD in Apple and Google files,
+    // IFD 0 itself in Samsung Expert RAW files, whose raw image is IFD 0). The specification
+    // does not give the blob's byte order: the file's is tried first (Apple's big-endian and
+    // Google's little-endian files each parse that way), then the other. A map outside the raw
+    // image's IFD, or one that does not parse, is reported and not applied, and the profile's
+    // tone curve, built for gained data, waits with it.
+    let gain_table_map = raw
+        .get(tag::PROFILE_GAIN_TABLE_MAP)
+        .and_then(|e| t.raw(e))
+        .and_then(|b| crate::GainTableMap::parse(b, t.le).or_else(|| crate::GainTableMap::parse(b, !t.le)));
+    let gain_table_unusable = gain_table_map.is_none() && (raw.has(tag::PROFILE_GAIN_TABLE_MAP) || ifd0.has(tag::PROFILE_GAIN_TABLE_MAP));
+    if gain_table_unusable {
+        warnings.push(if raw.has(tag::PROFILE_GAIN_TABLE_MAP) {
+            "DNG ProfileGainTableMap (local tone mapping) is malformed and not applied".to_string()
+        } else {
+            "DNG ProfileGainTableMap outside the raw IFD (local tone mapping) is not applied".to_string()
+        });
     }
 
     let max = ((1u32 << plane.bits) - 1) as f32;
@@ -276,9 +289,9 @@ pub(crate) fn decode(t: &Tiff, limits: &Limits) -> Result<Sensor> {
     // The DNG specification applies ProfileGainTableMap first, in linear light, then this curve.
     // Profiles that carry both (Apple ProRAW, Pixel) build the curve for gained data: without the
     // map it crushes the shadows (an iPhone 12 Pro file: mean dE against its own preview 15.7 with
-    // no curve, 24.2 with it), so the curve waits until the map is applied.
+    // no curve, 24.2 with it), so a curve whose map cannot be applied is left out too.
     let tone_curve = match ifd0.get(tag::PROFILE_TONE_CURVE) {
-        Some(_) if gain_table_map => {
+        Some(_) if gain_table_unusable => {
             warnings.push("DNG ProfileToneCurve is not applied without its ProfileGainTableMap".to_string());
             Vec::new()
         }
@@ -311,6 +324,7 @@ pub(crate) fn decode(t: &Tiff, limits: &Limits) -> Result<Sensor> {
         baseline_exposure: if baseline_exposure.is_finite() { baseline_exposure.clamp(-10.0, 10.0) } else { 0.0 },
         gain_maps,
         tone_curve,
+        gain_table_map,
         black_point: 0.0,
         warnings,
     })

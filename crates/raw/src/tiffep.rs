@@ -257,6 +257,7 @@ pub(crate) fn decode(t: &Tiff, format: RawFormat, limits: &Limits) -> Result<Sen
         baseline_exposure: 0.0,
         gain_maps: Vec::new(),
         tone_curve: Vec::new(),
+        gain_table_map: None,
         black_point: 0.0,
         warnings,
     };

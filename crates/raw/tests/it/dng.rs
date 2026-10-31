@@ -1255,3 +1255,134 @@ fn profile_tone_curve_is_interpolated_with_a_cubic_spline() {
     }
     assert!(s.tone_curve.windows(2).all(|w| w[1][1] >= w[0][1]));
 }
+
+/// A ProfileGainTableMap blob (DNG 1.6) in the given byte order: a `grid` (rows, columns) of
+/// tables of `n` gains each, placed by `spacing` and `origin` (vertical, horizontal), with grey
+/// input weights.
+fn gain_table_grid(grid: (u32, u32), n: u32, spacing: (f64, f64), origin: (f64, f64), gains: &[f32], big_endian: bool) -> Vec<u8> {
+    let mut b = Vec::new();
+    let u = |b: &mut Vec<u8>, v: u32| b.extend(if big_endian { v.to_be_bytes() } else { v.to_le_bytes() });
+    let d = |b: &mut Vec<u8>, v: f64| b.extend(if big_endian { v.to_be_bytes() } else { v.to_le_bytes() });
+    u(&mut b, grid.0);
+    u(&mut b, grid.1);
+    for v in [spacing.0, spacing.1, origin.0, origin.1] {
+        d(&mut b, v);
+    }
+    u(&mut b, n);
+    for w in [1.0f32 / 3.0, 1.0 / 3.0, 1.0 / 3.0, 0.0, 0.0].iter().chain(gains) {
+        u(&mut b, w.to_bits());
+    }
+    b
+}
+
+/// One table of `gains` covering the image.
+fn gain_table(gains: &[f32], big_endian: bool) -> Vec<u8> {
+    gain_table_grid((1, 1), gains.len() as u32, (0.0, 0.0), (0.0, 0.0), gains, big_endian)
+}
+
+/// `spec` with a ProfileGainTableMap in its raw IFD, where the specification places it.
+fn with_map(spec: &DngSpec, blob: Vec<u8>) -> DngSpec {
+    let mut s = spec.clone();
+    s.raw_extra.push((52525, Val::Undefined(blob)));
+    s
+}
+
+/// Mean of the developed 16-bit samples.
+fn mean_of(s: &Sensor, opts: &DevelopOptions) -> f64 {
+    let d = develop_sensor(s, opts).unwrap();
+    d.rgb.iter().map(|&v| f64::from(v)).sum::<f64>() / d.rgb.len() as f64
+}
+
+#[test]
+fn profile_gain_table_map_is_applied_before_the_tone_curve() {
+    let (w, h) = (16, 16);
+    let opts = DevelopOptions::default();
+    let curve = vec![0.0, 0.0, 0.25, 0.1, 0.5, 0.35, 1.0, 1.0];
+    let cfa = DngSpec::cfa(w, h, vec![1200; w * h]);
+    let mut linear = DngSpec::cfa(w, h, vec![1200; w * h * 3]);
+    linear.samples = 3;
+    for (base, kind) in [(cfa, "CFA"), (linear, "LinearRaw")] {
+        for big_endian in [false, true] {
+            let base = DngSpec { big_endian, ..base.clone() };
+            let plain = sensor(&base.build());
+            // A flat gain of 4 in the raw IFD brightens the develop, in either byte order.
+            let lifted = sensor(&with_map(&base, gain_table(&[4.0, 4.0], big_endian)).build());
+            assert!(lifted.gain_table_map.is_some(), "{kind} big endian {big_endian}: {:?}", lifted.warnings);
+            assert!(!lifted.warnings.iter().any(|w| w.contains("ProfileGainTableMap")), "{:?}", lifted.warnings);
+            assert!(mean_of(&lifted, &opts) > mean_of(&plain, &opts) * 1.5, "{kind}");
+            // With a map the profile's tone curve applies too, after it: a unit map changes
+            // nothing by itself.
+            let both = DngSpec { ifd0_extra: vec![(50940, Val::Double(curve.clone()))], ..with_map(&base, gain_table(&[1.0, 1.0], big_endian)) };
+            let curve_only = DngSpec { ifd0_extra: vec![(50940, Val::Double(curve.clone()))], ..base.clone() };
+            let (s, c) = (sensor(&both.build()), sensor(&curve_only.build()));
+            assert!(s.gain_table_map.is_some() && !s.tone_curve.is_empty(), "{:?}", s.warnings);
+            assert_eq!(develop_sensor(&s, &opts).unwrap().rgb, develop_sensor(&c, &opts).unwrap().rgb, "{kind}");
+        }
+    }
+}
+
+#[test]
+fn a_gain_table_map_outside_the_raw_ifd_is_reported_and_keeps_its_curve_out() {
+    // The raw image is a sub-IFD here and the map sits in IFD 0: the specification places the
+    // map in the raw image's IFD.
+    let base = DngSpec::cfa(8, 8, vec![500; 64]);
+    let spec = DngSpec {
+        profile_gain_table_map: Some(gain_table(&[4.0, 4.0], false)),
+        ifd0_extra: vec![(50940, Val::Double(vec![0.0, 0.0, 0.5, 0.25, 1.0, 1.0]))],
+        ..base.clone()
+    };
+    let s = sensor(&spec.build());
+    assert!(s.gain_table_map.is_none() && s.tone_curve.is_empty());
+    assert!(s.warnings.iter().any(|w| w.contains("outside the raw IFD")), "{:?}", s.warnings);
+    assert!(s.warnings.iter().any(|w| w.contains("ProfileToneCurve is not applied")), "{:?}", s.warnings);
+    let plain = sensor(&base.build());
+    assert_eq!(develop_sensor(&s, &DevelopOptions::default()).unwrap().rgb, develop_sensor(&plain, &DevelopOptions::default()).unwrap().rgb);
+}
+
+#[test]
+fn the_user_exposure_does_not_change_the_gain_table_input() {
+    // A map whose gain falls with its input: 2 at 0, 0.5 at 0.5 and above (index = input * 2).
+    // Its input is the pixel after BaselineExposure only; the user's Exposure scales the result.
+    let (w, h) = (8, 8);
+    let mut base = DngSpec::cfa(w, h, vec![6000; w * h * 3]);
+    base.samples = 3;
+    let unit = sensor(&with_map(&base, gain_table(&[1.0, 1.0], false)).build());
+    let falling = sensor(&with_map(&base, gain_table(&[2.0, 0.5], false)).build());
+    let linear = |s: &Sensor, ev: f64| {
+        let d = develop_sensor(s, &DevelopOptions { exposure: ev, ..Default::default() }).unwrap();
+        (f64::from(d.rgb[1]) / 65535.0).powf(1.8)
+    };
+    let x0 = linear(&unit, 0.0);
+    let gain = |x: f64| 2.0 + (0.5 - 2.0) * (2.0 * x).min(1.0);
+    for ev in [0.0, 1.0, -1.0] {
+        let want = x0 * 2f64.powf(ev) * gain(x0);
+        let got = linear(&falling, ev);
+        assert!((got - want).abs() < 2e-3 * want.max(0.01) + 2e-4, "{ev} EV: {got} vs {want}");
+    }
+    // The table input at +1 EV would have been 2 x0, a different gain: the test tells them apart.
+    assert!((gain(2.0 * x0) - gain(x0)).abs() > 0.1, "{x0}");
+}
+
+#[test]
+fn the_gain_table_map_is_placed_on_the_active_area() {
+    // Two tables across the active area (at 1/4 and 3/4 of its width): gain 1 on the left, 3 on
+    // the right. The develop keeps active columns 8..24, so a map placed on the crop instead
+    // would give clearly different gains at the columns checked.
+    let (w, h) = (32, 8);
+    let mut base = DngSpec::cfa(w, h, vec![3000; w * h * 3]);
+    base.samples = 3;
+    base.default_crop = Some(([8, 0], [16, 8]));
+    let map = gain_table_grid((1, 2), 1, (1.0, 0.5), (0.0, 0.25), &[1.0, 3.0], false);
+    let s = sensor(&with_map(&base, map).build());
+    let d = develop_sensor(&s, &DevelopOptions::default()).unwrap();
+    let at = |x: usize| (f64::from(d.rgb[(4 * d.width as usize + x) * 3 + 1]) / 65535.0).powf(1.8);
+    let flat = sensor(&with_map(&base, gain_table(&[1.0], false)).build());
+    let f = develop_sensor(&flat, &DevelopOptions::default()).unwrap();
+    let x0 = (f64::from(f.rgb[1]) / 65535.0).powf(1.8);
+    // Developed column 4 = active column 12: (12.5 / 32 - 0.25) / 0.5 = 0.28125 (on the crop it
+    // would be (4.5 / 16 - 0.25) / 0.5 = 0.0625, a gain of 1.125).
+    assert!((at(4) / x0 - 1.5625).abs() < 0.01, "{}", at(4) / x0);
+    // Developed column 12 = active column 20: (20.5 / 32 - 0.25) / 0.5 = 0.78125 (on the crop it
+    // would be past the right table, a gain of 3).
+    assert!((at(12) / x0 - 2.5625).abs() < 0.01, "{}", at(12) / x0);
+}

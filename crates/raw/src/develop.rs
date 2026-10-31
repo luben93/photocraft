@@ -277,14 +277,42 @@ fn develop(s: &Sensor, opts: &DevelopOptions, allow_fused: bool) -> Result<Devel
         Some(l) => GammaLut::with_tone(l.tone.as_ref()),
         None => GammaLut::with_curve(&s.tone_curve),
     };
+    // Linear ProPhoto of pixel `i` (`y * w + x` of the developed frame): the matrix and exposure,
+    // then the profile's gain table map (DNG 1.6), placed on the active area. Its table input is
+    // the pixel after BaselineExposure only (the specification's), and the user's Exposure scales
+    // the result, so the map does not undo an Exposure change; Dehaze, the tone map and the tone
+    // curve come after it.
+    let (ax, ay, aw, ah) = (c.x.saturating_sub(s.active.x), c.y.saturating_sub(s.active.y), s.active.width, s.active.height);
+    let user_exposure = 2f64.powf(opts.exposure.clamp(-10.0, 10.0)) as f32;
+    let placed = s.gain_table_map.as_ref().map(|m| m.placed(aw, ah));
+    let profiled = |i: usize, p: &[f32]| {
+        let v = pro(p);
+        match &placed {
+            Some(m) => {
+                let g = m.gain(ax + i % w, ay + i / w, v.map(|c| c / user_exposure));
+                v.map(|c| c * g)
+            }
+            None => v,
+        }
+    };
     // The default rendering: matrix then encode, in blocks so the encode's clamp and square root
-    // run over whole slices.
-    let encode_plain = |src: &[f32], dst: &mut [u16]| {
+    // run over whole slices. `first` is the index of `src`'s first pixel.
+    let encode_plain = |first: usize, src: &[f32], dst: &mut [u16]| {
         let mut buf = [0.0f32; ENCODE_BLOCK];
+        let mut i = first;
         for (oc, sc) in dst.chunks_mut(ENCODE_BLOCK).zip(src.chunks(ENCODE_BLOCK)) {
             let n = sc.len();
-            for (t, p) in buf[..n].as_chunks_mut::<3>().0.iter_mut().zip(sc.as_chunks::<3>().0) {
-                *t = pro(p);
+            let pixels = buf[..n].as_chunks_mut::<3>().0.iter_mut().zip(sc.as_chunks::<3>().0);
+            // Without a gain table map the loop stays the plain matrix (no per-pixel position).
+            if placed.is_some() {
+                for (t, p) in pixels {
+                    *t = profiled(i, p);
+                    i += 1;
+                }
+            } else {
+                for (t, p) in pixels {
+                    *t = pro(p);
+                }
             }
             lut.encode_into(&buf[..n], oc);
         }
@@ -415,7 +443,7 @@ fn develop(s: &Sensor, opts: &DevelopOptions, allow_fused: bool) -> Result<Devel
                     |b, chunk, buf| {
                         let buf = &mut buf[..chunk.len()];
                         linear_rows(b * band, buf);
-                        encode_plain(buf, chunk);
+                        encode_plain(b * band * w, buf, chunk);
                     },
                 );
                 fused_out = Some(o);
@@ -429,17 +457,17 @@ fn develop(s: &Sensor, opts: &DevelopOptions, allow_fused: bool) -> Result<Devel
     let out = match fused_out {
         Some(out) => out,
         None => {
-            let haze = Haze::new(w, h, |i| pro(&rgb[i * 3..i * 3 + 3]), opts.tone.dehaze);
+            let haze = Haze::new(w, h, |i| profiled(i, &rgb[i * 3..i * 3 + 3]), opts.tone.dehaze);
             // Linear ProPhoto of pixel `i` after Dehaze.
             let linear = |i: usize, p: &[f32]| {
-                let v = pro(p);
+                let v = profiled(i, p);
                 haze.as_ref().map_or(v, |z| z.apply(i % w, i / w, v))
             };
             let mut map = ToneMap::new(w, h, |i| lum(&linear(i, &rgb[i * 3..i * 3 + 3])), opts.tone, s.black_point);
             if let (Some(m), Some(_)) = (&mut map, &haze) {
                 // The black point belongs to the default rendering: Dehaze does not move it (taken after
                 // Dehaze it fell to almost 0, and Dehaze darkened less than Photoshop's).
-                m.black = black_level(w, h, |i| lum(&pro(&rgb[i * 3..i * 3 + 3])), s.black_point);
+                m.black = black_level(w, h, |i| lum(&profiled(i, &rgb[i * 3..i * 3 + 3])), s.black_point);
             }
             let mut out = vec![0u16; w * h * 3];
             let plain = map.is_none() && haze.is_none();
@@ -447,7 +475,7 @@ fn develop(s: &Sensor, opts: &DevelopOptions, allow_fused: bool) -> Result<Devel
                 let start = b * band * w * 3;
                 let src = &rgb[start..start + chunk.len()];
                 if plain {
-                    encode_plain(src, chunk);
+                    encode_plain(b * band * w, src, chunk);
                     return;
                 }
                 for (i, (o, p)) in chunk.as_chunks_mut::<3>().0.iter_mut().zip(src.as_chunks::<3>().0).enumerate() {
@@ -768,6 +796,7 @@ mod tests {
             baseline_exposure: 0.0,
             gain_maps: Vec::new(),
             tone_curve: vec![[0.18, 0.3], [1.0, 1.0]],
+            gain_table_map: None,
             black_point: 0.0,
             warnings: Vec::new(),
         }

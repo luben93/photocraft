@@ -167,6 +167,9 @@ pub struct Sensor {
     /// output]` pairs in linear ProPhoto, applied per channel after the colour conversion and
     /// exposure. Below the first point the curve is a line through 0; empty: no curve.
     pub tone_curve: Vec<[f32; 2]>,
+    /// The camera profile's DNG ProfileGainTableMap (local tone mapping), applied in linear
+    /// ProPhoto after exposure and before [`Self::tone_curve`]; `None`: none.
+    pub gain_table_map: Option<crate::GainTableMap>,
     /// Camera Raw's adaptive black point, for profiles that copy its default rendering: this
     /// factor times the 0.1th percentile of the image's linear luminance is subtracted before the
     /// tone curve (see `tone.rs`). 0: no black point.
