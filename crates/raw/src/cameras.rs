@@ -141,6 +141,19 @@ const PROFILES: &[Profile] = &[Profile {
 /// * **D800E** (2 files): the camera's JPEG sits 8 x 6 pixels in from the left
 ///   and top of the 7424 x 4924 sensor data (56 and 4 pixels of margin on the
 ///   right and bottom), the same corner as the D4.
+/// * **D800** (6 CC0 raw.pixls.us files, 12 and 14 bit, uncompressed, lossless
+///   and lossy): the same 7424 x 4924 plane and the same 7360 x 4912 camera JPEG
+///   at 8 x 6, aligned on the 14-bit uncompressed file. The files record no
+///   image area (CropHiSpeed 0x001B says 7424 x 4924 uncropped, no CropArea), and
+///   only 30 of the 56 right-hand columns are flat padding, so the rest showed as
+///   a magenta band (#10120).
+/// * **D5500, D5600, D7200** (2, 2 and 4 CC0 raw.pixls.us files): 8 x 8 pixels in
+///   from the left and top of the 6016 x 4016 sensor data, giving the camera JPEG's
+///   6000 x 4000 frame; the D3400 and D3500 record the same area in CropArea.
+/// * **D750** (4 files, 12 and 14 bit, lossy and lossless): 8 x 8 pixels in from
+///   the left and top of the 6032 x 4032 sensor data, giving 6016 x 4016.
+/// * **D810** (6 files): 12 x 8 pixels in from the left and top of the 7380 x 4928
+///   sensor data, giving the camera JPEG's 7360 x 4912 frame.
 /// * **D5100** (3 files): 8 x 8 pixels in from the left and top of the
 ///   4992 x 3280 sensor data, giving the camera JPEG's 4928 x 3264 frame.
 /// * **ILCE-7** (2 files): 12 x 12 pixels in from the left and top of the
@@ -152,6 +165,10 @@ const PROFILES: &[Profile] = &[Profile {
 /// * **ILCE-6000** (3 files): the same 12 x 12 origin and 6000 x 4000 image;
 ///   confirmed by the file's EXIF size and SR2SubIFD's area [12, 12, 6012, 4012],
 ///   and checked against the matching camera JPEGs. No colour profile is inferred.
+///
+/// The D800, D810, D750, D7200, D5500 and D5600 areas were measured with `photocraft-io`'s
+/// `rawarea` example, which develops the whole sensor and aligns the full-size camera JPEG
+/// on its most textured patches.
 struct ImageArea {
     make: &'static str,
     model: &'static str,
@@ -164,7 +181,13 @@ struct ImageArea {
 const IMAGE_AREAS: &[ImageArea] = &[
     ImageArea { make: "NIKON CORPORATION", model: "NIKON D90", size: (4352, 2868), crop: (10, 10, 4288, 2848) },
     ImageArea { make: "NIKON CORPORATION", model: "NIKON D5100", size: (4992, 3280), crop: (8, 8, 4928, 3264) },
+    ImageArea { make: "NIKON CORPORATION", model: "NIKON D800", size: (7424, 4924), crop: (8, 6, 7360, 4912) },
     ImageArea { make: "NIKON CORPORATION", model: "NIKON D800E", size: (7424, 4924), crop: (8, 6, 7360, 4912) },
+    ImageArea { make: "NIKON CORPORATION", model: "NIKON D810", size: (7380, 4928), crop: (12, 8, 7360, 4912) },
+    ImageArea { make: "NIKON CORPORATION", model: "NIKON D750", size: (6032, 4032), crop: (8, 8, 6016, 4016) },
+    ImageArea { make: "NIKON CORPORATION", model: "NIKON D7200", size: (6016, 4016), crop: (8, 8, 6000, 4000) },
+    ImageArea { make: "NIKON CORPORATION", model: "NIKON D5500", size: (6016, 4016), crop: (8, 8, 6000, 4000) },
+    ImageArea { make: "NIKON CORPORATION", model: "NIKON D5600", size: (6016, 4016), crop: (8, 8, 6000, 4000) },
     ImageArea { make: "SONY", model: "ILCE-7", size: (6048, 4024), crop: (12, 12, 6000, 4000) },
     ImageArea { make: "SONY", model: "ILCE-6000", size: (6048, 4024), crop: (12, 12, 6000, 4000) },
 ];
@@ -306,6 +329,30 @@ mod tests {
         // Only the image area is measured: levels, colour and tone stay untouched.
         assert!(s.color.calibrations.is_empty() && s.tone_curve.is_empty());
         assert_eq!(s.white, [16383.0; 3]);
+        let mut s = nef("NIKON D800", 7424, 4924);
+        apply(&mut s, 12);
+        assert_eq!(s.crop, Rect::new(8, 6, 7360, 4912));
+        assert!(s.color.calibrations.is_empty() && s.tone_curve.is_empty());
+        // The D800's trailing padding is trimmed from the active area first (7394 wide);
+        // the image area still lies inside it.
+        let mut s = nef("NIKON D800", 7424, 4924);
+        s.active = Rect::new(0, 0, 7394, 4924);
+        s.crop = s.active;
+        apply(&mut s, 14);
+        assert_eq!(s.crop, Rect::new(8, 6, 7360, 4912));
+        assert_eq!(s.crop.intersect(&s.active), s.crop);
+        for (model, w, h, crop) in [
+            ("NIKON D810", 7380, 4928, Rect::new(12, 8, 7360, 4912)),
+            ("NIKON D750", 6032, 4032, Rect::new(8, 8, 6016, 4016)),
+            ("NIKON D7200", 6016, 4016, Rect::new(8, 8, 6000, 4000)),
+            ("NIKON D5500", 6016, 4016, Rect::new(8, 8, 6000, 4000)),
+            ("NIKON D5600", 6016, 4016, Rect::new(8, 8, 6000, 4000)),
+        ] {
+            let mut s = nef(model, w, h);
+            apply(&mut s, 14);
+            assert_eq!(s.crop, crop, "{model}");
+            assert!(s.color.calibrations.is_empty() && s.tone_curve.is_empty());
+        }
 
         let mut s = sensor("SONY", "ILCE-7", 6048, 4024);
         apply(&mut s, 14);
@@ -328,7 +375,7 @@ mod tests {
         let mut s = nef("NIKON D800E", 2496, 1646);
         apply(&mut s, 14);
         assert_eq!(s.crop, Rect::new(0, 0, 2496, 1646));
-        let mut s = nef("NIKON D800", 7424, 4924);
+        let mut s = nef("NIKON D4S", 7424, 4924);
         apply(&mut s, 14);
         assert_eq!(s.crop, Rect::new(0, 0, 7424, 4924));
     }
@@ -365,7 +412,9 @@ mod tests {
 
     #[test]
     fn other_cameras_and_sizes_are_left_alone() {
-        for (model, w, h) in [("NIKON D4S", 4992, 3292), ("NIKON D4", 2496, 1646), ("NIKON D800", 7424, 4924)] {
+        for (model, w, h) in
+            [("NIKON D4S", 4992, 3292), ("NIKON D4", 2496, 1646), ("NIKON D800", 4992, 3292), ("NIKON D810", 7424, 4924), ("NIKON D3300", 6016, 4016)]
+        {
             let mut s = nef(model, w, h);
             apply(&mut s, 14);
             assert_eq!(s.crop, Rect::new(0, 0, w, h), "{model} {w}x{h}");
