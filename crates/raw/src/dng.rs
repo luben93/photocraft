@@ -221,6 +221,10 @@ pub(crate) fn decode(t: &Tiff, limits: &Limits) -> Result<Sensor> {
     if ifd0.has(tag::PROFILE_GAIN_TABLE_MAP) || raw.has(tag::PROFILE_GAIN_TABLE_MAP) {
         warnings.push("DNG ProfileGainTableMap (local tone mapping) is not applied".to_string());
     }
+    // The profile's hue / saturation / value tables (ProfileHueSatMapData1/2, ProfileLookTableData).
+    if [50938, 50939, 50982].into_iter().any(|tg| ifd0.has(tg)) {
+        warnings.push("DNG ProfileHueSatMap / ProfileLookTable (hue and saturation tables) are not applied".to_string());
+    }
 
     let max = ((1u32 << plane.bits) - 1) as f32;
     // A LinearizationTable maps integer samples; floating-point data is linear already.
@@ -272,6 +276,13 @@ pub(crate) fn decode(t: &Tiff, limits: &Limits) -> Result<Sensor> {
     if color.calibrations.is_empty() && (is_cfa || samples != 1) {
         warnings.push("the DNG has no colour matrix; colours are approximate".to_string());
     }
+    let tone_curve = match ifd0.get(tag::PROFILE_TONE_CURVE) {
+        Some(e) => profile_tone_curve(&t.floats(e)).unwrap_or_else(|| {
+            warnings.push("malformed DNG ProfileToneCurve; no tone curve applied".to_string());
+            Vec::new()
+        }),
+        None => Vec::new(),
+    };
     let baseline_exposure = t.tag_floats(&ifd0, tag::BASELINE_EXPOSURE).first().copied().unwrap_or(0.0)
         + t.tag_floats(&raw, tag::BASELINE_EXPOSURE_OFFSET).first().copied().unwrap_or(0.0);
     let model = t.tag_ascii(&ifd0, tag::UNIQUE_CAMERA_MODEL).or_else(|| t.tag_ascii(&ifd0, tag::MODEL));
@@ -294,8 +305,28 @@ pub(crate) fn decode(t: &Tiff, limits: &Limits) -> Result<Sensor> {
         orientation: crate::tiff::orientation(t.tag_uint(&ifd0, tag::ORIENTATION)),
         baseline_exposure: if baseline_exposure.is_finite() { baseline_exposure.clamp(-10.0, 10.0) } else { 0.0 },
         gain_maps,
-        tone_curve: Vec::new(),
+        tone_curve,
         black_point: 0.0,
         warnings,
     })
+}
+
+/// DNG ProfileToneCurve (DNG 1.2.0.0): `[input, output]` pairs in linear gamma, both in 0–1,
+/// starting at (0, 0) and ending at (1, 1). Apple ProRAW and Adobe-converted DNGs carry the
+/// profile's default curve here; without it their shadows render lifted and flat (#9904).
+/// The spec interpolates with a cubic spline; [`crate::develop::tone`] interpolates the knots
+/// log-linearly, which is indistinguishable at the 257 points such curves carry.
+/// `None` when the values are not such a curve (inputs must strictly increase).
+fn profile_tone_curve(v: &[f64]) -> Option<Vec<[f32; 2]>> {
+    let (pairs, rest) = v.as_chunks::<2>();
+    if pairs.len() < 2 || !rest.is_empty() {
+        return None;
+    }
+    let curve: Vec<[f32; 2]> = pairs.iter().map(|[x, y]| [*x as f32, *y as f32]).collect();
+    let in_range = curve.iter().flatten().all(|c| c.is_finite() && (0.0..=1.0).contains(c));
+    let increasing = curve.windows(2).all(|w| w[1][0] > w[0][0]);
+    let (first, last) = (curve.first()?, curve.last()?);
+    let ends = first[0] == 0.0 && first[1] == 0.0 && last[0] == 1.0 && last[1] == 1.0;
+    let identity = curve.iter().all(|[x, y]| x == y);
+    (in_range && increasing && ends).then(|| if identity { Vec::new() } else { curve })
 }

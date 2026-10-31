@@ -928,6 +928,61 @@ fn profile_gain_table_map_is_reported() {
     assert!(gain_table(&sensor(&spec.build())));
 }
 
+#[test]
+fn profile_hue_sat_and_look_tables_are_reported() {
+    let tables = |s: &Sensor| s.warnings.iter().any(|w| w.contains("ProfileHueSatMap"));
+    let base = DngSpec::cfa(8, 8, vec![500; 64]);
+    assert!(!tables(&sensor(&base.build())));
+    for tg in [50938, 50939, 50982] {
+        let spec = DngSpec { ifd0_extra: vec![(tg, Val::Double(vec![0.0, 1.0, 1.0]))], ..base.clone() };
+        assert!(tables(&sensor(&spec.build())), "tag {tg}");
+    }
+}
+
+#[test]
+fn profile_tone_curve_is_read_and_applied() {
+    let (w, h) = (16, 16);
+    let base = DngSpec::cfa(w, h, vec![1200; w * h]);
+    let with_curve = |values: Vec<f64>| DngSpec { ifd0_extra: vec![(50940, Val::Double(values))], ..base.clone() };
+    // A shadow-crushing curve like Apple ProRAW's (#9904): darker mid-tones, same end points.
+    let s = sensor(&with_curve(vec![0.0, 0.0, 0.25, 0.1, 0.5, 0.35, 1.0, 1.0]).build());
+    assert_eq!(s.tone_curve, vec![[0.0, 0.0], [0.25, 0.1], [0.5, 0.35], [1.0, 1.0]]);
+    assert!(!s.warnings.iter().any(|w| w.contains("ProfileToneCurve")));
+    let mean = |s: &Sensor| {
+        let d = develop_sensor(s, &DevelopOptions::default()).unwrap();
+        d.rgb.iter().map(|&v| f64::from(v)).sum::<f64>() / d.rgb.len() as f64
+    };
+    let plain = sensor(&base.build());
+    assert!(plain.tone_curve.is_empty());
+    assert!(mean(&s) < mean(&plain) * 0.95, "{} vs {}", mean(&s), mean(&plain));
+
+    // The identity curve is no curve.
+    let s = sensor(&with_curve(vec![0.0, 0.0, 0.5, 0.5, 1.0, 1.0]).build());
+    assert!(s.tone_curve.is_empty() && !s.warnings.iter().any(|w| w.contains("ProfileToneCurve")));
+}
+
+#[test]
+fn malformed_profile_tone_curves_are_ignored_with_a_warning() {
+    let base = DngSpec::cfa(8, 8, vec![500; 64]);
+    for values in [
+        vec![0.0, 0.0, 1.0],                          // odd count
+        vec![0.0, 0.0],                               // one point
+        vec![0.0, 0.0, 0.5, 0.2, 0.5, 0.6, 1.0, 1.0], // repeated input
+        vec![0.0, 0.0, 0.6, 0.2, 0.4, 0.6, 1.0, 1.0], // decreasing input
+        vec![0.0, 0.0, 0.5, f64::NAN, 1.0, 1.0],
+        vec![0.0, 0.0, 0.5, 1e300, 1.0, 1.0],
+        vec![0.0, 0.0, 0.5, -0.1, 1.0, 1.0],
+        vec![0.1, 0.0, 1.0, 1.0], // does not start at (0, 0)
+        vec![0.0, 0.0, 0.9, 0.9], // does not end at (1, 1)
+    ] {
+        let spec = DngSpec { ifd0_extra: vec![(50940, Val::Double(values.clone()))], ..base.clone() };
+        let s = sensor(&spec.build());
+        assert!(s.tone_curve.is_empty(), "{values:?}");
+        assert!(s.warnings.iter().any(|w| w.contains("ProfileToneCurve")), "{values:?}");
+        develop_sensor(&s, &DevelopOptions::default()).unwrap();
+    }
+}
+
 // ---------------------------------------------------------------- lossy DNG (compression 34892)
 
 /// The largest difference between decoded and source samples, in stored (8-bit) levels.
