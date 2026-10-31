@@ -85,7 +85,7 @@ fn image(w: usize, h: usize, max: i32, seed: u32) -> Vec<i32> {
 
 fn lossless(bits: u32) -> DecodeTable {
     let s = 1 << (bits - 3);
-    DecodeTable { encoding: Encoding::Lossless, seeds: [[s, s], [s, s]] }
+    DecodeTable { encoding: Encoding::Lossless, seeds: [[s, s], [s, s]], split: 0 }
 }
 
 fn lossy_table(bits: u32, le: bool) -> Vec<u8> {
@@ -165,7 +165,7 @@ fn unsupported_and_malformed_tables() {
     let malformed = |r: Result<DecodeTable>| matches!(r, Err(RawError::Malformed(_)));
     let mut split = lossy_table(12, false);
     split[562..564].copy_from_slice(&345u16.to_be_bytes());
-    assert!(unsupported(parse_table(&split, false, 12)));
+    assert_eq!(parse_table(&split, false, 12).unwrap().split, 345);
     assert!(unsupported(parse_table(&[0x49, 0x30, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], false, 12)));
     assert!(unsupported(parse_table(&lossy_table(12, false), false, 16)));
     assert!(malformed(parse_table(&[], false, 12)));
@@ -244,7 +244,8 @@ fn decodes_through_the_nef_container() {
     assert_eq!(s.data, img.iter().map(|&v| curve[v as usize]).collect::<Vec<_>>());
     assert_eq!(s.black.values, vec![150.0; 4]);
     assert!(crate::develop_sensor(&s, &crate::DevelopOptions::default()).is_ok());
-    // "lossy after split" and a missing table stay unsupported (preview fallback)
+    // a split row over a stream that does not follow the fixed-rate rule, and a missing
+    // table, stay unsupported (preview fallback)
     let mut split = table;
     split[562..564].copy_from_slice(&3u16.to_le_bytes());
     let e = crate::decode(&nef_compressed(w, h, 12, src.clone(), [2, 1, 1, 0], false, vec![(0x0096, Val::Undefined(split))]), &Limits::default());
@@ -303,4 +304,100 @@ fn truncated_and_corrupt_streams_error_never_panic() {
     assert!(decode(&[0xff; 64], 8, 8, 12, &lossy).is_err());
     assert!(decode(&src, usize::MAX, 2, 14, &table).is_err());
     assert!(decode(&src, 0, 2, 14, &table).is_err());
+}
+
+/// Encodes `values` the way a "lossy after split" camera does: Huffman (`t`) for rows above
+/// `split`, then fixed-rate words of `bits - 4` bits, then one-bits up to the byte boundary.
+/// Every fixed-rate difference must be small enough to keep all its additional bits.
+fn encode_split(values: &[i32], w: usize, t: &Table, seeds: [[i32; 2]; 2], bits: u32, split: usize) -> Vec<u8> {
+    let codes = codes(t);
+    let (word, fixed) = if bits == 12 { (8, FIXED_12) } else { (10, FIXED_14) };
+    let mut wr = Writer::default();
+    let mut vpred = seeds;
+    for (y, row) in values.chunks(w).enumerate() {
+        for (x, &v) in row.iter().enumerate() {
+            let pred = if x < 2 { vpred[y & 1][x] } else { row[x - 2] };
+            if x < 2 {
+                vpred[y & 1][x] = v;
+            }
+            let d = v - pred;
+            let k = 32 - d.unsigned_abs().leading_zeros();
+            let extra = if d < 0 { (d + (1 << k) - 1) as u32 } else { d as u32 };
+            if y < split {
+                let (code, len) = codes[k as usize];
+                wr.put(code, len);
+                wr.put(extra, k);
+            } else {
+                let &(prefix, len, _) = fixed.iter().find(|c| c.2 == k).unwrap();
+                assert!(k <= word - len, "difference {d} would lose bits");
+                wr.put(prefix, len);
+                wr.put(extra << (word - len - k), word - len);
+            }
+        }
+    }
+    while wr.n > 0 {
+        wr.put(1, 1);
+    }
+    wr.out
+}
+
+/// Small steps around a level (every difference below 32), so the fixed-rate words keep them whole.
+fn gentle(w: usize, h: usize, base: i32) -> Vec<i32> {
+    (0..w * h).map(|i| base + ((i % w) as i32 * 3 + (i / w) as i32 * 5) % 13 + if i % 7 == 0 { 7 } else { 0 }).collect()
+}
+
+#[test]
+fn lossy_after_split_known_answers() {
+    for bits in [12u32, 14] {
+        let (w, h, split) = (24usize, 7usize, 3usize);
+        let mut table = lossy_table(bits, false);
+        table[562..564].copy_from_slice(&(split as u16).to_be_bytes());
+        let t = parse_table(&table, false, bits).unwrap();
+        assert_eq!(t.split, split);
+        let Encoding::Lossy(curve) = &t.encoding else { panic!() };
+        let img = gentle(w, h, 600);
+        let src = encode_split(&img, w, if bits == 12 { &LOSSY_12 } else { &LOSSY_14 }, t.seeds, bits, split);
+        let out = decode(&src, w, h, bits, &t).unwrap();
+        assert_eq!(out, img.iter().map(|&v| curve[v as usize]).collect::<Vec<_>>(), "{bits}-bit");
+    }
+}
+
+#[test]
+fn lossy_after_split_dequantises_to_symmetric_bin_centres() {
+    for bits in [12u32, 14] {
+        let lut = fixed_words(bits);
+        let values: Vec<i32> = lut.iter().flatten().copied().collect();
+        // Every word but the all-ones one codes a difference, and the codes are symmetric.
+        assert_eq!(values.len(), lut.len() - 1, "{bits}-bit");
+        assert!(lut.last().unwrap().is_none());
+        for v in &values {
+            assert!(values.contains(&-v), "{bits}-bit: {v} has no negative twin");
+        }
+        // Small differences are exact; the largest category reaches the full range.
+        for d in -31..=31 {
+            assert!(values.contains(&d), "{bits}-bit: {d}");
+        }
+        let top = *values.iter().max().unwrap();
+        assert!(top > 1 << (bits - 4), "{bits}-bit: {top}");
+    }
+}
+
+#[test]
+fn lossy_after_split_refuses_strips_that_break_the_rule() {
+    let (w, h, split) = (24usize, 7usize, 3usize);
+    let mut table = lossy_table(12, false);
+    table[562..564].copy_from_slice(&(split as u16).to_be_bytes());
+    let t = parse_table(&table, false, 12).unwrap();
+    let img = gentle(w, h, 600);
+    let src = encode_split(&img, w, &LOSSY_12, t.seeds, 12, split);
+    let unsupported = |r: Result<Vec<u16>>| matches!(r, Err(RawError::Unsupported(_)));
+    // Trailing data the fixed-rate section does not account for.
+    let mut longer = src.clone();
+    longer.extend_from_slice(&[0x12; 9]);
+    assert!(unsupported(decode(&longer, w, h, 12, &t)));
+    // A truncated strip, a split beyond the image, and a split on a lossless table: errors, no panic.
+    assert!(decode(&src[..src.len() - 12], w, h, 12, &t).is_err());
+    assert!(decode(&src, w, split, 12, &t).is_err());
+    let lossless_split = DecodeTable { split, ..lossless(12) };
+    assert!(decode(&src, w, h, 12, &lossless_split).is_err());
 }
